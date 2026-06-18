@@ -1,4 +1,4 @@
-# wechat-uia-k
+# wechat-uia-keepalive
 
 微信 4.x UIA 前置工具 — 模拟 Windows 无障碍客户端，暴露完整 UI 树，为自动化（如 pyweixin）做准备。
 
@@ -23,7 +23,7 @@
 
 ## 快速开始（推荐）
 
-1. 从 [Releases](../../releases) 下载 `WeChatUIA-Tool.exe`
+1. 从 [Releases](https://github.com/NewbieCheng/wechat-uia-keepalive/releases) 下载 `WeChatUIA-Tool.exe`
 2. 双击运行，或双击同目录下的 `启动工具.bat`
 3. 选择菜单 **1** 执行完整前置引导（默认 6 分钟预热后启动微信）
 4. 引导完成后可输入 **2** 反复探测、**3** 导出控件树、**8** 导出诊断报告
