@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+dist/
+WeChatUIA-Tool.exe
+*.spec.bak
+
+# Logs & diagnostics
+logs/
+*.log
+diagnostic_*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
