@@ -14,6 +14,7 @@ import ctypes.wintypes
 import logging
 import os
 import queue
+import subprocess
 import threading
 import time
 import winreg
@@ -26,6 +27,7 @@ import win32api
 import win32con
 import win32gui
 import win32process
+import win32security
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,41 @@ WECHAT_KNOWN_CLASSES = frozenset(
     {WECHAT_SHELL_CLASS, "mmui::MainWindow", "mmui::LoginWindow"}
 )
 VISIBLE_CLASS_PREFIX = "mmui::"
+
+RENDER_PRESET_ORDER: tuple[str, ...] = ("community", "full_software", "angle_warp")
+
+RENDER_PRESET_LABELS: dict[str, str] = {
+    "community": "社区推荐",
+    "full_software": "全软件栈",
+    "angle_warp": "ANGLE WARP",
+}
+
+RENDER_PRESETS: dict[str, dict[str, str]] = {
+    "community": {
+        "QT_OPENGL": "software",
+    },
+    "full_software": {
+        "QT_OPENGL": "software",
+        "QT_QUICK_BACKEND": "software",
+    },
+    "angle_warp": {
+        "QT_OPENGL": "software",
+        "QT_QUICK_BACKEND": "software",
+        "QT_ANGLE_PLATFORM": "warp",
+    },
+}
+
+_GPU_ENV_KEYS: tuple[str, ...] = (
+    "QT_OPENGL",
+    "QT_ANGLE_PLATFORM",
+    "QT_QUICK_BACKEND",
+)
+
+# Backward-compatible alias
+SOFT_RENDER_ENV = RENDER_PRESETS["angle_warp"]
+
+_session_cpu_launched = False
+_session_render_preset = "community"
 
 PM_REMOVE = 0x0001
 
@@ -134,6 +171,12 @@ class ProbeResult:
         if self.error:
             payload["error"] = self.error
         return payload
+
+
+@dataclass
+class LaunchResult:
+    launched: bool
+    reason: str = "ok"
 
 
 def _process_basename(pid: int) -> str:
@@ -242,15 +285,161 @@ def get_weixin_file_version(exe_path: str) -> str:
         return ""
 
 
-def launch_weixin(exe_path: str | None = None) -> bool:
-    """Launch WeChat if not already running. Returns True when launch was attempted."""
-    if is_weixin_running():
+def get_render_preset() -> str:
+    return _session_render_preset
+
+
+def set_render_preset(preset: str) -> str:
+    global _session_render_preset
+    if preset not in RENDER_PRESETS:
+        raise ValueError(f"Unknown render preset: {preset!r}")
+    _session_render_preset = preset
+    return preset
+
+
+def next_render_preset(current: str | None = None) -> str:
+    preset = current or get_render_preset()
+    if preset not in RENDER_PRESET_ORDER:
+        return RENDER_PRESET_ORDER[0]
+    idx = RENDER_PRESET_ORDER.index(preset)
+    return RENDER_PRESET_ORDER[(idx + 1) % len(RENDER_PRESET_ORDER)]
+
+
+def format_render_preset_label(preset: str | None = None) -> str:
+    preset = preset or get_render_preset()
+    label = RENDER_PRESET_LABELS.get(preset, preset)
+    return f"{label} ({preset})"
+
+
+def build_launch_env(preset: str | None = None) -> dict[str, str]:
+    preset_id = preset or get_render_preset()
+    if preset_id not in RENDER_PRESETS:
+        raise ValueError(f"Unknown render preset: {preset_id!r}")
+
+    env = os.environ.copy()
+    for key in _GPU_ENV_KEYS:
+        env.pop(key, None)
+    env.update(RENDER_PRESETS[preset_id])
+    return env
+
+
+def _is_current_process_elevated() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
         return False
+
+
+def _process_is_elevated(pid: int) -> bool:
+    handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    try:
+        token = win32security.OpenProcessToken(handle, win32con.TOKEN_QUERY)
+        try:
+            return bool(win32security.IsTokenElevated(token))
+        finally:
+            win32api.CloseHandle(token)
+    except Exception:
+        return False
+    finally:
+        win32api.CloseHandle(handle)
+
+
+def _weixin_pids() -> list[int]:
+    pids: list[int] = []
+    for pid in win32process.EnumProcesses():
+        try:
+            if _process_basename(pid).lower() == "weixin.exe":
+                pids.append(pid)
+        except Exception:
+            continue
+    return pids
+
+
+def _system_dpi_percent() -> int:
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        return max(100, int(round(dpi / 96 * 100)))
+    except Exception:
+        return 100
+
+
+def collect_launch_readiness() -> dict[str, Any]:
+    """Pre-flight checks before bootstrap launch."""
+    issues: list[str] = []
+    weixin_running = is_weixin_running()
+    tool_elevated = _is_current_process_elevated()
+
+    if weixin_running:
+        issues.append("请先完全退出微信")
+        pids = _weixin_pids()
+        weixin_elevated = any(_process_is_elevated(pid) for pid in pids)
+        if weixin_elevated != tool_elevated:
+            issues.append("建议工具与微信都用/都不用管理员")
+
+    dpi_percent = _system_dpi_percent()
+    if dpi_percent > 100:
+        issues.append(f"系统缩放 {dpi_percent}%，可设兼容性 DPI=系统")
+
+    installed = False
+    exe_path = ""
+    try:
+        exe_path = where_weixin()
+        installed = os.path.isfile(exe_path)
+        if not installed:
+            issues.append("未找到 Weixin.exe")
+    except Exception as exc:
+        issues.append(f"未找到微信安装路径: {exc}")
+
+    return {
+        "ready": not issues,
+        "issue_count": len(issues),
+        "issues": issues,
+        "summary": "通过" if not issues else f"{len(issues)} 项待处理",
+        "weixin_running": weixin_running,
+        "tool_elevated": tool_elevated,
+        "system_dpi_percent": dpi_percent,
+        "installed": installed,
+        "exe_path": exe_path,
+    }
+
+
+def get_render_mode() -> str:
+    """Return render mode token for the status panel."""
+    if not is_weixin_running():
+        return "not_running"
+    if _session_cpu_launched:
+        return "cpu_software"
+    return "unknown_running"
+
+
+def launch_weixin(
+    exe_path: str | None = None,
+    *,
+    preset: str | None = None,
+) -> LaunchResult:
+    """Launch WeChat with CPU software rendering if not already running."""
+    global _session_cpu_launched, _session_render_preset
+
+    preset_id = preset or get_render_preset()
+    set_render_preset(preset_id)
+
+    if is_weixin_running():
+        return LaunchResult(launched=False, reason="already_running")
+
     path = exe_path or where_weixin()
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Weixin.exe not found: {path}")
-    os.startfile(path)
-    return True
+
+    env = build_launch_env(preset_id)
+    install_dir = os.path.dirname(path)
+    subprocess.Popen(
+        [path],
+        cwd=install_dir,
+        env=env,
+        close_fds=False,
+    )
+    _session_cpu_launched = True
+    return LaunchResult(launched=True, reason="ok")
 
 
 def _control_type_name(control_type_id: int) -> str:
@@ -608,6 +797,21 @@ class WeChatA11yClient:
         self._sta.start()
         return self._sta.call(lambda: self._probe_impl(hwnd))
 
+    def walk_desktop_shallow(self, max_depth: int = 2) -> int:
+        """Shallow walk of desktop root to signal an active a11y client."""
+
+        def _impl() -> int:
+            root = self._sta.automation.GetRootElement()
+            return _walk_tree(
+                root,
+                self._sta.walker,
+                max_depth=max_depth,
+                max_children=min(self.max_children, 8),
+            )
+
+        self._sta.start()
+        return self._sta.call(_impl)
+
     def dump(
         self,
         hwnd: int | None = None,
@@ -758,12 +962,16 @@ class WeChatA11yClient:
 
 def collect_env_info(*, probe_ui: bool = False) -> dict[str, Any]:
     """Collect WeChat install/runtime info for the tool status panel."""
+    readiness = collect_launch_readiness()
     info: dict[str, Any] = {
-        "installed": False,
-        "exe_path": "",
+        "installed": readiness.get("installed", False),
+        "exe_path": readiness.get("exe_path") or "",
         "registry_version": "",
         "file_version": "",
         "running": is_weixin_running(),
+        "render_mode": get_render_mode(),
+        "render_preset": get_render_preset(),
+        "readiness": readiness,
         "ui_visible": False,
         "ui_class": "",
         "ui_reason": "",
@@ -773,7 +981,7 @@ def collect_env_info(*, probe_ui: bool = False) -> dict[str, Any]:
         "nodes_touched": 0,
     }
     try:
-        exe_path = where_weixin()
+        exe_path = info["exe_path"] or where_weixin()
         info["installed"] = os.path.isfile(exe_path)
         info["exe_path"] = exe_path
         info["registry_version"] = get_weixin_version()
@@ -802,6 +1010,9 @@ def collect_env_info(*, probe_ui: bool = False) -> dict[str, Any]:
     elif not probe_ui:
         info["ui_reason"] = "not_probed"
 
+    info["render_mode"] = get_render_mode()
+    info["render_preset"] = get_render_preset()
+    info["readiness"] = collect_launch_readiness()
     return info
 
 

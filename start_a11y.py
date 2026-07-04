@@ -26,12 +26,41 @@ def _log(message: str, *args: object) -> None:
         pass
 
 
+def _print_status_human(result: ProbeResult) -> None:
+    status = "可见" if result.visible else "不可见"
+    print(
+        f"[探测] {status} | class={result.class_name or '-'} | "
+        f"reason={result.reason} | children={result.children_count}",
+        flush=True,
+    )
+    if result.error:
+        print(f"[探测] 错误: {result.error}", flush=True)
+
+
 def _print_status(result: ProbeResult, jsonl: bool) -> None:
-    payload = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **result.to_dict()}
     if jsonl:
+        payload = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **result.to_dict()}
         print(json.dumps(payload, ensure_ascii=False), flush=True)
     else:
-        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        _print_status_human(result)
+
+
+def probe_weixin_once(*, log_result: bool = True) -> ProbeResult:
+    """Probe WeChat UI once without printing to stdout."""
+    client = WeChatA11yClient()
+    try:
+        result = client.probe()
+        if log_result:
+            _log(
+                "probe once visible=%s class=%s hwnd=%s reason=%s",
+                result.visible,
+                result.class_name,
+                result.hwnd,
+                result.reason,
+            )
+        return result
+    finally:
+        client.stop()
 
 
 def _print_dump(client: WeChatA11yClient, max_depth: int) -> int:
@@ -98,6 +127,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Print one compact JSON object per line.",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Do not print probe result to stdout (log file only).",
+    )
+    parser.add_argument(
         "--raw-view",
         action="store_true",
         help="Use RawViewWalker instead of ControlViewWalker.",
@@ -112,7 +146,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.once:
         result = client.probe()
-        _print_status(result, args.jsonl)
+        if not args.quiet:
+            _print_status(result, args.jsonl)
         _log(
             "probe once visible=%s class=%s hwnd=%s reason=%s",
             result.visible,
@@ -121,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
             result.reason,
         )
         client.stop()
-        return 0
+        return 0 if result.visible else 1
 
     if args.dump:
         code = _print_dump(client, max_depth=args.dump_depth)

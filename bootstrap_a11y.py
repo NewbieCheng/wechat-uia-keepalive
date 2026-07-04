@@ -15,9 +15,14 @@ from typing import Any, Callable
 from a11y_client import (
     ElementInfo,
     ProbeResult,
+    WECHAT_SHELL_CLASS,
     WeChatA11yClient,
+    format_render_preset_label,
+    get_render_preset,
     is_weixin_running,
     launch_weixin,
+    next_render_preset,
+    set_render_preset,
 )
 
 try:
@@ -140,14 +145,22 @@ def _log_phase(phase: str, jsonl: bool, **extra: Any) -> None:
 def _log_phase_human(phase: str, **extra: Any) -> None:
     if phase == "bootstrap_start":
         delay = extra.get("launch_delay_sec", 360)
+        preset = extra.get("render_preset", get_render_preset())
         _log_info("=" * 56)
         _log_info("  微信 4.x UIA 前置引导")
         _log_info("=" * 56)
         _log_info(
             f"[步骤 1/4] 预热 {int(delay)} 秒后启动微信；"
-            f"期间请保持本窗口运行。"
+            f"渲染预设: {format_render_preset_label(preset)}"
         )
-        _log("bootstrap_start delay=%ss interval=%s depth=%s", delay, extra.get("interval"), extra.get("depth"))
+        _log_info("           期间请保持本窗口运行。")
+        _log(
+            "bootstrap_start delay=%ss interval=%s depth=%s preset=%s",
+            delay,
+            extra.get("interval"),
+            extra.get("depth"),
+            preset,
+        )
         return
     if phase == "launch_skipped":
         _log_info("[步骤 2/4] 已跳过启动微信。")
@@ -155,15 +168,26 @@ def _log_phase_human(phase: str, **extra: Any) -> None:
     if phase == "launch_weixin":
         if extra.get("already_running"):
             _log_info("[步骤 2/4] 检测到微信已在运行，跳过启动。")
+            _log_info(
+                "[提示] 请先完全退出微信，再执行前置引导，以确保 CPU 软件渲染生效。"
+            )
         else:
-            _log_info("[步骤 2/4] 正在启动微信...")
+            preset = extra.get("render_preset", get_render_preset())
+            _log_info(
+                f"[步骤 2/4] 正在以 CPU 软件渲染模式启动微信"
+                f"（{format_render_preset_label(preset)}）..."
+            )
         return
     if phase == "launch_failed":
         _log_info(f"[错误] 无法启动微信: {extra.get('error', 'unknown')}")
         return
     if phase == "launch_done":
         if extra.get("launched"):
-            _log_info("[步骤 2/4] 微信已启动。")
+            preset = extra.get("render_preset", get_render_preset())
+            _log_info(
+                f"[步骤 2/4] 微信已以 CPU 软件渲染模式启动"
+                f"（{format_render_preset_label(preset)}）。"
+            )
         return
     if phase == "wait_visible":
         timeout = int(extra.get("timeout_sec", 300))
@@ -182,6 +206,46 @@ def _log_phase_human(phase: str, **extra: Any) -> None:
         return
     if phase == "bootstrap_stopped":
         return
+
+
+def _needs_retry_hint(result: ProbeResult) -> bool:
+    if result.visible:
+        return False
+    if result.class_name == WECHAT_SHELL_CLASS:
+        return True
+    return result.reason in {"ui_tree_hidden", "timeout", "window_not_found"}
+
+
+def _print_retry_hint(preset: str, result: ProbeResult, jsonl: bool) -> None:
+    if jsonl or not _needs_retry_hint(result):
+        return
+    suggested = next_render_preset(preset)
+    _log_info(
+        f"[提示] 预设 {format_render_preset_label(preset)} 未能暴露 UI 树"
+        f"（class={result.class_name or '-'}）。"
+    )
+    _log_info(
+        f"[提示] 请完全退出微信，按菜单 9 切换到"
+        f"「{format_render_preset_label(suggested)}」后重试引导。"
+    )
+
+
+def _make_warmup_tick(client: WeChatA11yClient, interval: float) -> Callable[[], None]:
+    last_walk = 0.0
+
+    def _tick() -> None:
+        nonlocal last_walk
+        now = time.monotonic()
+        if now - last_walk < max(interval, 2.0):
+            return
+        last_walk = now
+        try:
+            nodes = client.walk_desktop_shallow(max_depth=2)
+            _log("warmup desktop walk nodes=%s", nodes)
+        except Exception as exc:
+            _log("warmup desktop walk failed: %s", exc)
+
+    return _tick
 
 
 def _print_probe(result: ProbeResult, jsonl: bool, phase: str) -> None:
@@ -405,8 +469,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run a single probe and exit (debug).",
     )
+    parser.add_argument(
+        "--render-preset",
+        choices=("community", "full_software", "angle_warp"),
+        default=None,
+        help="CPU render preset for launching WeChat (default: community).",
+    )
     args = parser.parse_args(argv)
     _ensure_utf8_console()
+
+    preset = args.render_preset or get_render_preset()
+    set_render_preset(preset)
 
     client = WeChatA11yClient(interval=args.interval, tree_depth=args.depth)
 
@@ -422,27 +495,45 @@ def main(argv: list[str] | None = None) -> int:
         launch_delay_sec=args.launch_delay,
         interval=args.interval,
         depth=args.depth,
+        render_preset=preset,
     )
 
     client.start(background=True)
+    warmup_tick = _make_warmup_tick(client, args.interval)
     try:
-        _warmup_countdown(args.launch_delay, args.jsonl)
+        _warmup_countdown(args.launch_delay, args.jsonl, on_tick=warmup_tick)
 
         if args.skip_launch:
             _log_phase("launch_skipped", args.jsonl, already_running=is_weixin_running())
         else:
-            _log_phase("launch_weixin", args.jsonl, already_running=is_weixin_running())
-            try:
-                launched = launch_weixin()
-            except FileNotFoundError as exc:
-                _log_phase("launch_failed", args.jsonl, error=str(exc))
-                return 1
+            already = is_weixin_running()
             _log_phase(
-                "launch_done",
+                "launch_weixin",
                 args.jsonl,
-                launched=launched,
-                already_running=not launched,
+                already_running=already,
+                render_preset=preset,
             )
+            if not already:
+                try:
+                    launch_result = launch_weixin(preset=preset)
+                except FileNotFoundError as exc:
+                    _log_phase("launch_failed", args.jsonl, error=str(exc))
+                    return 1
+                _log_phase(
+                    "launch_done",
+                    args.jsonl,
+                    launched=launch_result.launched,
+                    already_running=False,
+                    render_preset=preset,
+                )
+            else:
+                _log_phase(
+                    "launch_done",
+                    args.jsonl,
+                    launched=False,
+                    already_running=True,
+                    render_preset=preset,
+                )
 
         _log_phase("wait_visible", args.jsonl, timeout_sec=args.wait_timeout)
         result = _wait_with_progress(
@@ -452,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             jsonl=args.jsonl,
         )
         _print_probe(result, args.jsonl, phase="wait_result")
+        _print_retry_hint(preset, result, args.jsonl)
 
         if not result.visible:
             return 1
