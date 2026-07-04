@@ -18,11 +18,16 @@ from a11y_client import (
     WECHAT_SHELL_CLASS,
     WeChatA11yClient,
     format_render_preset_label,
+    format_warmup_preset_label,
     get_render_preset,
+    get_warmup_delay_seconds,
+    get_warmup_preset,
     is_weixin_running,
     launch_weixin,
     next_render_preset,
+    next_warmup_preset,
     set_render_preset,
+    set_warmup_preset,
 )
 
 try:
@@ -144,22 +149,25 @@ def _log_phase(phase: str, jsonl: bool, **extra: Any) -> None:
 
 def _log_phase_human(phase: str, **extra: Any) -> None:
     if phase == "bootstrap_start":
-        delay = extra.get("launch_delay_sec", 360)
+        delay = extra.get("launch_delay_sec", get_warmup_delay_seconds())
         preset = extra.get("render_preset", get_render_preset())
+        warmup = extra.get("warmup_preset", get_warmup_preset())
         _log_info("=" * 56)
         _log_info("  微信 4.x UIA 前置引导")
         _log_info("=" * 56)
         _log_info(
             f"[步骤 1/4] 预热 {int(delay)} 秒后启动微信；"
+            f"预热档位: {format_warmup_preset_label(warmup)}；"
             f"渲染预设: {format_render_preset_label(preset)}"
         )
         _log_info("           期间请保持本窗口运行。")
         _log(
-            "bootstrap_start delay=%ss interval=%s depth=%s preset=%s",
+            "bootstrap_start delay=%ss interval=%s depth=%s preset=%s warmup=%s",
             delay,
             extra.get("interval"),
             extra.get("depth"),
             preset,
+            warmup,
         )
         return
     if phase == "launch_skipped":
@@ -216,16 +224,30 @@ def _needs_retry_hint(result: ProbeResult) -> bool:
     return result.reason in {"ui_tree_hidden", "timeout", "window_not_found"}
 
 
-def _print_retry_hint(preset: str, result: ProbeResult, jsonl: bool) -> None:
+def _print_retry_hint(
+    preset: str,
+    warmup_preset: str,
+    result: ProbeResult,
+    jsonl: bool,
+) -> None:
     if jsonl or not _needs_retry_hint(result):
+        return
+    _log_info(
+        f"[提示] 预设 {format_render_preset_label(preset)} + "
+        f"{format_warmup_preset_label(warmup_preset)} 未能暴露 UI 树"
+        f"（class={result.class_name or '-'}）。"
+    )
+    if warmup_preset != "maximum":
+        suggested_warmup = next_warmup_preset(warmup_preset)
+        _log_info(
+            f"[提示] 请完全退出微信，按菜单 10 加长预热至"
+            f"「{format_warmup_preset_label(suggested_warmup)}」后重试引导。"
+        )
+        _log_info("[提示] 若仍失败，可再按菜单 9 切换渲染预设。")
         return
     suggested = next_render_preset(preset)
     _log_info(
-        f"[提示] 预设 {format_render_preset_label(preset)} 未能暴露 UI 树"
-        f"（class={result.class_name or '-'}）。"
-    )
-    _log_info(
-        f"[提示] 请完全退出微信，按菜单 9 切换到"
+        f"[提示] 最长预热仍失败，请完全退出微信，按菜单 9 切换到"
         f"「{format_render_preset_label(suggested)}」后重试引导。"
     )
 
@@ -496,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
         interval=args.interval,
         depth=args.depth,
         render_preset=preset,
+        warmup_preset=get_warmup_preset(),
     )
 
     client.start(background=True)
@@ -543,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
             jsonl=args.jsonl,
         )
         _print_probe(result, args.jsonl, phase="wait_result")
-        _print_retry_hint(preset, result, args.jsonl)
+        _print_retry_hint(preset, get_warmup_preset(), result, args.jsonl)
 
         if not result.visible:
             return 1

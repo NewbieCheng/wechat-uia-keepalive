@@ -76,6 +76,24 @@ SOFT_RENDER_ENV = RENDER_PRESETS["angle_warp"]
 _session_cpu_launched = False
 _session_render_preset = "community"
 
+WARMUP_PRESET_ORDER: tuple[str, ...] = ("standard", "extended", "long", "maximum")
+
+WARMUP_PRESET_SECONDS: dict[str, int] = {
+    "standard": 360,
+    "extended": 480,
+    "long": 600,
+    "maximum": 900,
+}
+
+WARMUP_PRESET_LABELS: dict[str, str] = {
+    "standard": "标准 6 分钟",
+    "extended": "加强 8 分钟",
+    "long": "长效 10 分钟",
+    "maximum": "最长 15 分钟",
+}
+
+_session_warmup_preset = "standard"
+
 PM_REMOVE = 0x0001
 
 # UIA ControlTypeId -> name (subset)
@@ -309,6 +327,38 @@ def format_render_preset_label(preset: str | None = None) -> str:
     preset = preset or get_render_preset()
     label = RENDER_PRESET_LABELS.get(preset, preset)
     return f"{label} ({preset})"
+
+
+def get_warmup_preset() -> str:
+    return _session_warmup_preset
+
+
+def set_warmup_preset(preset: str) -> str:
+    global _session_warmup_preset
+    if preset not in WARMUP_PRESET_SECONDS:
+        raise ValueError(f"Unknown warmup preset: {preset!r}")
+    _session_warmup_preset = preset
+    return preset
+
+
+def next_warmup_preset(current: str | None = None) -> str:
+    preset = current or get_warmup_preset()
+    if preset not in WARMUP_PRESET_ORDER:
+        return WARMUP_PRESET_ORDER[0]
+    idx = WARMUP_PRESET_ORDER.index(preset)
+    return WARMUP_PRESET_ORDER[(idx + 1) % len(WARMUP_PRESET_ORDER)]
+
+
+def get_warmup_delay_seconds(preset: str | None = None) -> float:
+    preset_id = preset or get_warmup_preset()
+    return float(WARMUP_PRESET_SECONDS.get(preset_id, WARMUP_PRESET_SECONDS["standard"]))
+
+
+def format_warmup_preset_label(preset: str | None = None) -> str:
+    preset = preset or get_warmup_preset()
+    label = WARMUP_PRESET_LABELS.get(preset, preset)
+    seconds = int(get_warmup_delay_seconds(preset))
+    return f"{label} ({seconds}s / {preset})"
 
 
 def build_launch_env(preset: str | None = None) -> dict[str, str]:
@@ -971,6 +1021,8 @@ def collect_env_info(*, probe_ui: bool = False) -> dict[str, Any]:
         "running": is_weixin_running(),
         "render_mode": get_render_mode(),
         "render_preset": get_render_preset(),
+        "warmup_preset": get_warmup_preset(),
+        "warmup_delay_sec": int(get_warmup_delay_seconds()),
         "readiness": readiness,
         "ui_visible": False,
         "ui_class": "",
@@ -1012,6 +1064,8 @@ def collect_env_info(*, probe_ui: bool = False) -> dict[str, Any]:
 
     info["render_mode"] = get_render_mode()
     info["render_preset"] = get_render_preset()
+    info["warmup_preset"] = get_warmup_preset()
+    info["warmup_delay_sec"] = int(get_warmup_delay_seconds())
     info["readiness"] = collect_launch_readiness()
     return info
 

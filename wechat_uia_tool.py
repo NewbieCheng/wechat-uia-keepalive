@@ -17,15 +17,20 @@ import start_a11y
 from a11y_client import (
     collect_env_info,
     format_render_preset_label,
+    format_warmup_preset_label,
     get_render_mode,
     get_render_preset,
+    get_warmup_delay_seconds,
+    get_warmup_preset,
     next_render_preset,
+    next_warmup_preset,
     set_render_preset,
+    set_warmup_preset,
 )
 from tool_log import get_logger, log_dir, log_file_path, setup_logging
 
 TOOL_NAME = "微信 UIA 前置工具"
-TOOL_VERSION = "1.3.1"
+TOOL_VERSION = "1.3.2"
 AUTHOR = "ChaseZ"
 CONTENT_WIDTH = 72
 LABEL_WIDTH = 12
@@ -163,23 +168,33 @@ def _bootstrap_argv_with_preset(extra: list[str] | None = None) -> list[str]:
     preset = get_render_preset()
     if not any(arg == "--render-preset" for arg in argv):
         argv.extend(["--render-preset", preset])
+    if not any(arg == "--launch-delay" for arg in argv):
+        argv.extend(["--launch-delay", str(get_warmup_delay_seconds())])
     return argv
 
 
 def _bootstrap_history_message(code: int, env: dict[str, Any]) -> str:
     preset = env.get("render_preset") or get_render_preset()
+    warmup = env.get("warmup_preset") or get_warmup_preset()
     preset_label = format_render_preset_label(preset)
+    warmup_label = format_warmup_preset_label(warmup)
     if code == 0:
-        return f"引导 → 前置引导完成（{preset_label}），UI 已暴露"
+        return f"引导 → 前置引导完成（{warmup_label} / {preset_label}），UI 已暴露"
     if env.get("render_mode") == "unknown_running":
         return f"引导 → 微信已在运行，未切换 CPU 渲染（{preset_label}）"
     if not env.get("ui_visible"):
+        if warmup != "maximum":
+            suggested_warmup = format_warmup_preset_label(next_warmup_preset(warmup))
+            return (
+                f"引导 → 未暴露（{warmup_label} / {preset_label}），请关闭微信后"
+                f"用菜单 10 加长预热至「{suggested_warmup}」重试"
+            )
         suggested = format_render_preset_label(next_render_preset(preset))
         return (
-            f"引导 → 未暴露（{preset_label}），请关闭微信后"
+            f"引导 → 最长预热仍失败（{preset_label}），请关闭微信后"
             f"用菜单 9 切换到「{suggested}」重试"
         )
-    return f"引导 → 前置引导结束（{preset_label}）"
+    return f"引导 → 前置引导结束（{warmup_label} / {preset_label}）"
 
 
 def _format_weixin_version(env: dict[str, Any]) -> str:
@@ -219,6 +234,10 @@ def _banner_lines(env: dict[str, Any]) -> list[str]:
             "渲染预设",
             format_render_preset_label(env.get("render_preset")),
         ),
+        _format_status_line(
+            "预热档位",
+            format_warmup_preset_label(env.get("warmup_preset")),
+        ),
         _format_status_line("就绪检查", _format_readiness(env)),
         _format_status_line("日志文件", str(log_path)),
         divider,
@@ -226,18 +245,22 @@ def _banner_lines(env: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _menu_lines() -> list[str]:
+def _menu_lines(env: dict[str, Any] | None = None) -> list[str]:
+    warmup_hint = format_warmup_preset_label(
+        (env or {}).get("warmup_preset") or get_warmup_preset()
+    )
     return [
         "功能菜单",
-        "  1. 前置引导（默认 6 分钟后启动微信）",
+        f"  1. 前置引导（当前预热：{warmup_hint}）",
         "  2. 快速探测 UI 是否可见",
         "  3. 导出控件树（调查用）",
         "  4. 持续 Keepalive（Ctrl+C 停止）",
-        "  5. 前置引导（自定义预热秒数）",
+        "  5. 前置引导（自定义预热秒数，任意时长）",
         "  6. 刷新状态 / 环境信息",
         "  7. 打开日志目录",
         "  8. 导出诊断报告",
         "  9. 切换渲染预设并重试引导",
+        " 10. 切换预热档位并重试引导",
         "  0. 退出",
     ]
 
@@ -313,7 +336,7 @@ class SessionView:
             output.append("")
             output.extend(extra_lines)
         output.append("")
-        output.extend(_menu_lines())
+        output.extend(_menu_lines(env))
         if prompt:
             output.append("")
             output.append(prompt)
@@ -462,6 +485,7 @@ def _export_diagnostic_report(env: dict[str, Any]) -> tuple[int, str]:
         f"  已安装:     {env.get('installed')}",
         f"  运行中:     {env.get('running')}",
         f"  渲染预设:   {format_render_preset_label(env.get('render_preset'))}",
+        f"  预热档位:   {format_warmup_preset_label(env.get('warmup_preset'))}",
         f"  就绪检查:   {_format_readiness(env)}",
         "",
         "[UI Automation]",
@@ -520,13 +544,20 @@ def _dispatch_choice(
         return code, env, msg
 
     if choice == "5":
-        delay = _read_choice(session, env, "预热秒数 [360]: ", "360") or "360"
+        default_delay = str(int(get_warmup_delay_seconds()))
+        delay = (
+            _read_choice(session, env, f"预热秒数 [{default_delay}]: ", default_delay)
+            or default_delay
+        )
         code = bootstrap_a11y.main(
             _bootstrap_argv_with_preset(["--launch-delay", delay])
         )
         env = collect_env_info(probe_ui=True)
         if code == 0:
-            msg = f"引导 → 自定义预热 {delay} 秒完成（{format_render_preset_label()})"
+            msg = (
+                f"引导 → 自定义预热 {delay} 秒完成"
+                f"（{format_render_preset_label()})"
+            )
         else:
             msg = _bootstrap_history_message(code, env)
         return code, env, msg
@@ -559,10 +590,30 @@ def _dispatch_choice(
         readiness = env.get("readiness") or {}
         if readiness.get("weixin_running"):
             session.set_status(
-                "[提示] 请先完全退出微信，再按 1 或 9 执行引导。"
+                "[提示] 请先完全退出微信，再按 1、9 或 10 执行引导。"
             )
             return 1, env, (
                 f"预设 → 已切换到 {format_render_preset_label(new_preset)}"
+                f"（请先退出微信再引导）"
+            )
+        code = bootstrap_a11y.main(_bootstrap_argv_with_preset())
+        env = collect_env_info(probe_ui=True)
+        return code, env, _bootstrap_history_message(code, env)
+
+    if choice == "10":
+        current = get_warmup_preset()
+        new_warmup = next_warmup_preset(current)
+        set_warmup_preset(new_warmup)
+        env = collect_env_info(probe_ui=False)
+        env["warmup_preset"] = new_warmup
+        env["warmup_delay_sec"] = int(get_warmup_delay_seconds(new_warmup))
+        readiness = env.get("readiness") or {}
+        if readiness.get("weixin_running"):
+            session.set_status(
+                "[提示] 请先完全退出微信，再按 1、9 或 10 执行引导。"
+            )
+            return 1, env, (
+                f"预热 → 已切换到 {format_warmup_preset_label(new_warmup)}"
                 f"（请先退出微信再引导）"
             )
         code = bootstrap_a11y.main(_bootstrap_argv_with_preset())
@@ -629,7 +680,7 @@ def _interactive_loop(
         last_code, env, history_msg = _dispatch_choice(choice, env, session)
         if history_msg and choice != "7":
             session.append(history_msg)
-        if choice in {"1", "3", "4", "5", "9"}:
+        if choice in {"1", "3", "4", "5", "9", "10"}:
             session._cleared_once = False
             session.invalidate()
         menu_default = "2"

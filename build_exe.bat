@@ -22,7 +22,7 @@ echo [build] Done: dist\WeChatUIA-Tool.exe
 echo.
 echo Usage:
 echo   dist\WeChatUIA-Tool.exe              ^(interactive menu^)
-echo   dist\WeChatUIA-Tool.exe bootstrap    ^(6 min warmup + launch WeChat^)
+echo   dist\WeChatUIA-Tool.exe bootstrap    ^(standard 6 min warmup + launch WeChat^)
 echo   dist\WeChatUIA-Tool.exe probe        ^(check UI visibility^)
 echo   dist\WeChatUIA-Tool.exe dump         ^(inspect control tree^)
 echo   dist\WeChatUIA-Tool.exe keepalive    ^(continuous UIA client^)
